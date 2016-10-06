@@ -16,41 +16,31 @@
 package boomer
 
 import (
-	"crypto/tls"
-	"io"
-	"io/ioutil"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
-type result struct {
-	err           error
-	statusCode    int
-	duration      time.Duration
-	contentLength int64
+type Result struct {
+	Err           error
+	StatusCode    int
+	Duration      time.Duration
+	ContentLength int64
 }
 
 type Boomer struct {
 	// Request is the request to be made.
-	Request *http.Request
+	Request BoomExecutor
 
-	RequestBody string
+	Body []byte
 
 	// N is the total number of requests to make.
-	N int
+	NumRequest int
 
 	// C is the concurrency level, the number of concurrent workers to run.
-	C int
-
-	// H2 is an option to make HTTP/2 requests
-	H2 bool
+	ConcurrentCalls int
 
 	// Timeout in seconds.
 	Timeout int
@@ -72,48 +62,98 @@ type Boomer struct {
 	// Optional.
 	ProxyAddr *url.URL
 
-	results chan *result
+	Results chan *Result
+
+	// Results channel receiver will forward results to this channel
+	Aggregator *Aggregator
 }
 
-// Run makes all the requests, prints the summary. It blocks until
-// all work is done.
-func (b *Boomer) Run() {
-	b.results = make(chan *result, b.N)
+type Boomable interface {
+	GetBooms() []*Boomer
+}
+
+type Aggregator struct {
+	wg        *sync.WaitGroup
+	agg       chan *Result
+	done      chan WriteOutput
+	boomCount int
+}
+
+func Run(boomie Boomable, writeOutChan chan<- WriteOutput) {
+	booms := boomie.GetBooms()
+
+	var w sync.WaitGroup
+	aggregator := &Aggregator{
+		wg:        &w,
+		agg:       make(chan *Result, len(booms)),
+		done:      make(chan WriteOutput),
+		boomCount: len(booms),
+	}
+
+	go startAggregatingResults(aggregator)
+
+	for _, b := range booms {
+		b.Aggregator = aggregator
+		output := b.Run()
+		writeOutChan <- output
+	}
+
+	reportAvg := <-aggregator.done
+
+	writeOutChan <- reportAvg
+	close(writeOutChan)
+}
+
+/**
+*  Should be called in a goroutine.
+*  Receives forwarded results from Boomers and generates an aggregate report.
+*  Blocks until all Boomers have run.
+ */
+func startAggregatingResults(aggr *Aggregator) {
+	aggr.wg.Add(aggr.boomCount)
+	go func() {
+		aggr.wg.Wait()
+		close(aggr.agg)
+	}()
+
+	start := time.Now()
+
+	finalReport := NewAggregatorReport()
+
+	// Listen for results until all boom reports have been finalized
+	for res := range aggr.agg {
+		finalReport.recordResult(res)
+	}
+
+	// the original library would wait for all requests to finish before creating a report. For aggregate scores,
+	// I'm generating an empty report and averaging results as they come in, then setting the time afterwards
+	finalReport.TotalTime = time.Now().Sub(start)
+	finalReport.averageResults()
+
+	report, csv := finalReport.print()
+
+	aggr.done <- WriteOutput{finalReport, report, csv, "COMBINED"}
+}
+
+func (b *Boomer) Run() WriteOutput {
+	b.Results = make(chan *Result, b.NumRequest)
 
 	start := time.Now()
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
-
 	go func() {
 		<-c
 		// TODO(jbd): Progress bar should not be finalized.
-		newReport(b.N, b.results, b.Output, time.Now().Sub(start)).finalize()
+		NewExecutorReport(b.Request, b.Results, b.Aggregator, b.Output, time.Now().Sub(start)).finalize()
 		os.Exit(1)
 	}()
 
 	b.runWorkers()
-	newReport(b.N, b.results, b.Output, time.Now().Sub(start)).finalize()
-	close(b.results)
-}
+	report := NewExecutorReport(b.Request, b.Results, b.Aggregator, b.Output, time.Now().Sub(start))
+	output, csv := report.finalize()
 
-func (b *Boomer) makeRequest(c *http.Client) {
-	s := time.Now()
-	var size int64
-	var code int
-
-	resp, err := c.Do(cloneRequest(b.Request, b.RequestBody))
-	if err == nil {
-		size = resp.ContentLength
-		code = resp.StatusCode
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}
-	b.results <- &result{
-		statusCode:    code,
-		duration:      time.Now().Sub(s),
-		err:           err,
-		contentLength: size,
-	}
+	close(b.Results)
+	return WriteOutput{report, output, csv, b.Request.GetRequestType()}
 }
 
 func (b *Boomer) runWorker(n int) {
@@ -122,55 +162,24 @@ func (b *Boomer) runWorker(n int) {
 		throttle = time.Tick(time.Duration(1e6/(b.Qps)) * time.Microsecond)
 	}
 
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		DisableCompression: b.DisableCompression,
-		DisableKeepAlives:  b.DisableKeepAlives,
-		// TODO(jbd): Add dial timeout.
-		TLSHandshakeTimeout: time.Duration(b.Timeout) * time.Millisecond,
-		Proxy:               http.ProxyURL(b.ProxyAddr),
-	}
-	if b.H2 {
-		http2.ConfigureTransport(tr)
-	} else {
-		tr.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
-	}
-	client := &http.Client{Transport: tr}
 	for i := 0; i < n; i++ {
 		if b.Qps > 0 {
 			<-throttle
 		}
-		b.makeRequest(client)
+		b.Request.Execute(b.Results)
 	}
 }
 
 func (b *Boomer) runWorkers() {
 	var wg sync.WaitGroup
-	wg.Add(b.C)
+	wg.Add(b.ConcurrentCalls)
 
 	// Ignore the case where b.N % b.C != 0.
-	for i := 0; i < b.C; i++ {
+	for i := 0; i < b.ConcurrentCalls; i++ {
 		go func() {
-			b.runWorker(b.N / b.C)
+			b.runWorker(b.NumRequest / b.ConcurrentCalls)
 			wg.Done()
 		}()
 	}
 	wg.Wait()
-}
-
-// cloneRequest returns a clone of the provided *http.Request.
-// The clone is a shallow copy of the struct and its Header map.
-func cloneRequest(r *http.Request, body string) *http.Request {
-	// shallow copy of the struct
-	r2 := new(http.Request)
-	*r2 = *r
-	// deep copy of the Header
-	r2.Header = make(http.Header, len(r.Header))
-	for k, s := range r.Header {
-		r2.Header[k] = append([]string(nil), s...)
-	}
-	r2.Body = ioutil.NopCloser(strings.NewReader(body))
-	return r2
 }

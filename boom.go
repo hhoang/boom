@@ -27,18 +27,6 @@ import (
 	"github.com/rakyll/boom/boomer"
 )
 
-const notice = `
-************************** WARNING ********************************
-This project has moved to https://github.com/rakyll/hey
-
-Use the following command to install the new binary:
-$ go get github.com/rakyll/hey
-
-Program boom might be broken in the long future, please update your
-environment rather than depending on this deprecated binary. 
-*******************************************************************
-`
-
 const (
 	headerRegexp = `^([\w-]+):\s*(.+)`
 	authRegexp   = `^(.+):([^\s].+)`
@@ -63,17 +51,13 @@ var (
 	accept      = flag.String("A", "", "")
 	contentType = flag.String("T", "text/html", "")
 	authHeader  = flag.String("a", "", "")
-	hostHeader  = flag.String("host", "", "")
 
 	output = flag.String("o", "", "")
 
-	c = flag.Int("c", 50, "")
-	n = flag.Int("n", 200, "")
-	q = flag.Int("q", 0, "")
-	t = flag.Int("t", 0, "")
-
-	h2 = flag.Bool("h2", false, "")
-
+	c    = flag.Int("c", 50, "")
+	n    = flag.Int("n", 200, "")
+	q    = flag.Int("q", 0, "")
+	t    = flag.Int("t", 0, "")
 	cpus = flag.Int("cpus", runtime.GOMAXPROCS(-1), "")
 
 	disableCompression = flag.Bool("disable-compression", false, "")
@@ -102,25 +86,21 @@ Options:
   -a  Basic authentication, username:password.
   -x  HTTP Proxy address as host:port.
 
-  -h2  Make HTTP/2 requests.
-
   -disable-compression  Disable compression.
   -disable-keepalive    Disable keep-alive, prevents re-use of TCP
                         connections between different HTTP requests.
   -cpus                 Number of used cpu cores.
                         (default for current machine is %d cores)
-  -host                 HTTP Host header.
 `
 
 func main() {
-	fmt.Println(notice) // show deprecation notice
 	flag.Usage = func() {
 		fmt.Fprint(os.Stderr, fmt.Sprintf(usage, runtime.NumCPU()))
 	}
 
 	flag.Var(&headerslice, "H", "")
-	flag.Parse()
 
+	flag.Parse()
 	if flag.NArg() < 1 {
 		usageAndExit("")
 	}
@@ -132,10 +112,6 @@ func main() {
 
 	if num <= 0 || conc <= 0 {
 		usageAndExit("n and c cannot be smaller than 1.")
-	}
-
-	if num < conc {
-		usageAndExit("n cannot be less than c")
 	}
 
 	url := flag.Args()[0]
@@ -193,11 +169,6 @@ func main() {
 		req.SetBasicAuth(username, password)
 	}
 
-	// set host header if set
-	if *hostHeader != "" {
-		req.Host = *hostHeader
-	}
-
 	(&boomer.Boomer{
 		Request:            req,
 		RequestBody:        *body,
@@ -207,7 +178,6 @@ func main() {
 		Timeout:            *t,
 		DisableCompression: *disableCompression,
 		DisableKeepAlives:  *disableKeepAlives,
-		H2:                 *h2,
 		ProxyAddr:          proxyURL,
 		Output:             *output,
 	}).Run()
